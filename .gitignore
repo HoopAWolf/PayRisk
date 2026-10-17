@@ -1,0 +1,4 @@
+_deps/
+CMakeFiles/
+_CPack_Packages/
+build/
