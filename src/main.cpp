@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <charconv>
+#include <ctime>
 
 using json = nlohmann::json;
 
@@ -46,7 +47,7 @@ struct TxnRecord
     AIDecision ai_decision{AIDecision::NONE};
     std::string ai_explanation{};
     std::string action_taken{};
-    std::chrono::system_clock::time_point received_at{};
+    std::string received_at{};
 };
 
 struct Token 
@@ -309,16 +310,34 @@ std::optional<int64_t> parse_cents(const std::string& s)
     return whole_value * 100 + frac_value;
 }
 
+std::string now_iso8601_utc()
+{
+    auto now = std::chrono::system_clock::now();
+    std::time_t time = std::chrono::system_clock::to_time_t(now);
+
+    std::tm tm{};
+    gmtime_r(&time, &tm);
+
+    char buf[32];
+    if(std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+    {
+        return "";
+    }
+
+    return std::string(buf);
+}
+
 std::optional<TxnRecord> parse_event(const json& body) 
 {
+    static TxnRecord txn;
     static std::unordered_set<std::string> event_types{"PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.DENIED"};
 
     try
     {
 
-        const std::string event_type = body.value("event_type", "");
+        txn.event_type = body.value("event_type", "");
 
-        if(event_types.find(event_type) == event_types.end())
+        if(event_types.find(txn.event_type) == event_types.end())
         {
             return std::nullopt;
         }
@@ -329,13 +348,13 @@ std::optional<TxnRecord> parse_event(const json& body)
         }
 
         const auto& res = body["resource"];
-        const std::string event_id = body.value("id", "");
-        const std::string capture_id = res.value("capture_id", "");
-        const std::string status = res.value("status", "");
-        const std::string create_time = res.value("create_time", "");
-        const std::string order_id = body.value(json::json_pointer("/resource/supplementary_data/related_ids/order_id"), std::string{});
+        txn.event_id = body.value("id", "");
+        txn.capture_id = res.value("capture_id", "");
+        txn.status = res.value("status", "");
+        txn.create_time = res.value("create_time", "");
+        txn.order_id = body.value(json::json_pointer("/resource/supplementary_data/related_ids/order_id"), std::string{});
 
-        if(!(res.contains("amount") && res["amount"].is_object()) || event_id.empty() || capture_id.empty())
+        if(!(res.contains("amount") && res["amount"].is_object()) || txn.event_id.empty() || txn.capture_id.empty())
         {
             return std::nullopt;
         }
@@ -352,7 +371,9 @@ std::optional<TxnRecord> parse_event(const json& body)
             return std::nullopt;
         }
 
-        
+        txn.amount_cents = *amount_cents;
+        txn.received_at = now_iso8601_utc();
+        return txn;
     }
     catch(const json::exception&)
     {
@@ -432,6 +453,29 @@ int main()
         VerifyResult result = verify_webhook(req);
         if(result == VerifyResult::RESULT_VERIFIED)
         {
+            auto body = json::parse(req.body, nullptr, false);
+
+            if(body.is_discarded())
+            {
+                std::cerr << "Webhook body is not valid JSON" << std::endl;
+                res.status = 401;
+                res.set_content("Webhook body is not valid JSON", "text/plain");
+                return;
+            }
+
+            auto rec = parse_event(body);
+            if(!rec)
+            {
+                std::cerr << "Webhook body is not a valid event " << body.value("event_type", "") << std::endl;
+                res.status = 401;
+                res.set_content("Webhook body is not a valid event " + body.value("event_type", ""), "text/plain");
+                return;
+            }
+
+            std::cout  << "Received event: " << rec->event_type << ", eventID: " << rec->event_id 
+            << ", capture_id: " << rec->capture_id << ", order_id: " << rec->order_id << ", currency: " << rec->currency 
+            << ", amount_cents: " << rec->amount_cents << ", status: " << rec->status << ", received at: " << rec->received_at << std::endl;
+
             res.status = 200;
             res.set_content("ok", "text/plain");
         }
@@ -452,6 +496,7 @@ int main()
             std::cout << "Header PAYPAL-CERT-URL: " << req.get_header_value("PAYPAL-CERT-URL") << std::endl;
             std::cout << "Header PAYPAL-TRANSMISSION-SIG: " << req.get_header_value("PAYPAL-TRANSMISSION-SIG") << std::endl;
             std::cout << "Header PAYPAL-TRANSMISSION-TIME: " << req.get_header_value("PAYPAL-TRANSMISSION-TIME") << std::endl << std::endl;
+
     });
 
     // TODO: GET /api/txns   (data for the dashboard)
