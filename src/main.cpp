@@ -10,6 +10,12 @@
 #include <optional>
 #include <charconv>
 #include <ctime>
+#include <unordered_set>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 
 using json = nlohmann::json;
 
@@ -49,6 +55,43 @@ struct TxnRecord
     std::string action_taken{};
     std::string received_at{};
 };
+struct TxnStore
+{
+    explicit TxnStore(size_t cap = 1000) : capacity(cap > 0 ? cap : 1) {}
+    
+    bool add(TxnRecord rec)
+    {
+        std::lock_guard lock(mtx);
+
+        if(event_ids.find(rec.event_id) != event_ids.end())
+        {
+            std::cerr << "Duplicate event_id: " << rec.event_id << std::endl;
+            return false; // duplicate event_id, ignore
+        }
+
+        if(txns.size() >= capacity)
+        {
+            event_ids.erase(txns.front().event_id);
+            txns.pop_front();
+        }
+        
+        event_ids.insert(rec.event_id);
+        txns.push_back(std::move(rec));
+        return true;  
+    }
+
+    std::vector<TxnRecord> snapshot() const
+    {
+        std::lock_guard lock(mtx);
+        return std::vector<TxnRecord>(txns.rbegin(), txns.rend());
+    }
+
+    private:
+    std::deque<TxnRecord> txns{};
+    std::unordered_set<std::string> event_ids{};
+    size_t capacity{1000};
+    mutable std::mutex mtx{};
+};
 
 struct Token 
 {
@@ -62,6 +105,7 @@ struct Token
 // TODO: where do transactions live? (in-memory deque, SQLite, file log?)
 // TODO: who reads/writes it, and from which threads? Protect accordingly.
 // ---------------------------------------------------------------------------
+static TxnStore g_txn_store{};
 
 // ---------------------------------------------------------------------------
 // 3. PAYPAL CLIENT
@@ -329,56 +373,125 @@ std::string now_iso8601_utc()
 
 std::optional<TxnRecord> parse_event(const json& body) 
 {
-    static TxnRecord txn;
-    static std::unordered_set<std::string> event_types{"PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.DENIED"};
+    static const std::unordered_set<std::string> event_types{"PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.DENIED"};
 
     try
     {
-
+        TxnRecord txn;
         txn.event_type = body.value("event_type", "");
 
         if(event_types.find(txn.event_type) == event_types.end())
         {
+            std::cerr << "Webhook body is not a valid event type: " << txn.event_type << std::endl;
             return std::nullopt;
         }
 
         if(!(body.contains("resource") && body["resource"].is_object()))
         {
+            std::cerr << "Webhook body is missing resource object" << std::endl;
             return std::nullopt;
         }
 
         const auto& res = body["resource"];
         txn.event_id = body.value("id", "");
-        txn.capture_id = res.value("capture_id", "");
+        txn.capture_id = res.value("id", "");
         txn.status = res.value("status", "");
         txn.create_time = res.value("create_time", "");
         txn.order_id = body.value(json::json_pointer("/resource/supplementary_data/related_ids/order_id"), std::string{});
 
-        if(!(res.contains("amount") && res["amount"].is_object()) || txn.event_id.empty() || txn.capture_id.empty())
+        if(!(res.contains("amount") && res["amount"].is_object()))
         {
+            std::cerr << "Webhook body is missing amount object" << std::endl;
             return std::nullopt;
         }
 
         const auto& amount_data = res["amount"];
 
-        const std::string value = amount_data.value("value ","");
-        const std::string currency_code = amount_data.value("currency_code ","");
+        const std::string value = amount_data.value("value","");
+        const std::string currency_code = amount_data.value("currency_code","");
 
         const std::optional<int64_t> amount_cents = parse_cents(value);
 
         if(amount_cents == std::nullopt || currency_code != "USD") //Only handle USD for now as other currencies have different minor units
         {          
+            std::cerr << "Webhook body has invalid amount or currency" << std::endl;
+            return std::nullopt;
+        }
+
+        if(txn.event_id.empty())
+        {
+            std::cerr << "Webhook body is missing event_id" << std::endl;
+            return std::nullopt;
+        }
+        
+        if(txn.capture_id.empty())
+        {
+            std::cerr << "Webhook body is missing capture_id" << std::endl;
             return std::nullopt;
         }
 
         txn.amount_cents = *amount_cents;
+        txn.currency = currency_code;
         txn.received_at = now_iso8601_utc();
         return txn;
     }
-    catch(const json::exception&)
+    catch(const json::exception& e)
     {
+        std::cerr << "Webhook body is not a valid JSON object: " << e.what() << std::endl;
         return std::nullopt;
     }
+}
+
+void handle_webhook(const httplib::Request& req, httplib::Response& res)
+{
+    const VerifyResult result = verify_webhook(req);
+    if(result == VerifyResult::RESULT_VERIFIED)
+    {
+        const auto body = json::parse(req.body, nullptr, false);
+        if(body.is_discarded())
+        {
+            std::cerr << "Webhook body is not valid JSON" << std::endl;
+            res.status = 400;
+            res.set_content("Webhook body is not valid JSON", "text/plain");
+            return;
+        }
+
+        const auto rec = parse_event(body);
+        
+        if(rec == std::nullopt)
+        {
+            std::cerr << "Webhook body is not a valid event " << body.value("event_type", "") << std::endl;
+            res.status = 200;
+            res.set_content("skipped", "text/plain");
+            return;
+        }
+
+        if(!g_txn_store.add(*rec))
+        {
+            res.status = 200;
+            res.set_content("duplicate event_id", "text/plain");
+            return;
+        }
+
+        std::cout  << "Received event: " << rec->event_type << ", eventID: " << rec->event_id 
+        << ", capture_id: " << rec->capture_id << ", order_id: " << rec->order_id << ", currency: " << rec->currency 
+        << ", amount_cents: " << rec->amount_cents << ", status: " << rec->status << ", received at: " << rec->received_at << std::endl;
+
+        res.status = 200;
+        res.set_content("ok", "text/plain");
+    }
+    else if(result == VerifyResult::RESULT_REJECTED)
+    {
+        res.status = 401;
+        res.set_content("rejected", "text/plain"); // forged or malformed: drop it
+        return;
+    }  
+    else
+    {
+        res.status = 503;
+        res.set_content("verification unavailable", "text/plain"); // our side failed: ask PayPal to retry later
+        return;
+    }  
 }
 
 // ---------------------------------------------------------------------------
@@ -448,58 +561,35 @@ int main()
     });
 
     //   verify -> parse -> score -> store -> enqueue for triage -> ack quickly
-    svr.Post("/webhook", [](const httplib::Request &req, httplib::Response &res) 
-    {
-        VerifyResult result = verify_webhook(req);
-        if(result == VerifyResult::RESULT_VERIFIED)
-        {
-            auto body = json::parse(req.body, nullptr, false);
-
-            if(body.is_discarded())
-            {
-                std::cerr << "Webhook body is not valid JSON" << std::endl;
-                res.status = 401;
-                res.set_content("Webhook body is not valid JSON", "text/plain");
-                return;
-            }
-
-            auto rec = parse_event(body);
-            if(!rec)
-            {
-                std::cerr << "Webhook body is not a valid event " << body.value("event_type", "") << std::endl;
-                res.status = 401;
-                res.set_content("Webhook body is not a valid event " + body.value("event_type", ""), "text/plain");
-                return;
-            }
-
-            std::cout  << "Received event: " << rec->event_type << ", eventID: " << rec->event_id 
-            << ", capture_id: " << rec->capture_id << ", order_id: " << rec->order_id << ", currency: " << rec->currency 
-            << ", amount_cents: " << rec->amount_cents << ", status: " << rec->status << ", received at: " << rec->received_at << std::endl;
-
-            res.status = 200;
-            res.set_content("ok", "text/plain");
-        }
-        else if(result == VerifyResult::RESULT_REJECTED)
-        {
-            res.status = 401;
-            res.set_content("error", "text/plain");
-        }  
-        else
-        {
-            res.status = 503;
-            res.set_content("error", "text/plain");
-        }  
-         
-            std::cout << "\nBody: " << req.body << std::endl;
-            std::cout << "Header PAYPAL-TRANSMISSION-ID: " << req.get_header_value("PAYPAL-TRANSMISSION-ID") << std::endl;
-            std::cout << "Header PAYPAL-AUTH-ALGO: " << req.get_header_value("PAYPAL-AUTH-ALGO") << std::endl;
-            std::cout << "Header PAYPAL-CERT-URL: " << req.get_header_value("PAYPAL-CERT-URL") << std::endl;
-            std::cout << "Header PAYPAL-TRANSMISSION-SIG: " << req.get_header_value("PAYPAL-TRANSMISSION-SIG") << std::endl;
-            std::cout << "Header PAYPAL-TRANSMISSION-TIME: " << req.get_header_value("PAYPAL-TRANSMISSION-TIME") << std::endl << std::endl;
-
-    });
+    svr.Post("/webhook", handle_webhook);
 
     // TODO: GET /api/txns   (data for the dashboard)
+    svr.Get("/api/txns", [](const httplib::Request &, httplib::Response &res) 
+    {
+        const auto txns = g_txn_store.snapshot();
+        json j = json::array();
+        for(const auto& t : txns)
+        {
+            j.push_back({
+                {"event_id", t.event_id},
+                {"event_type", t.event_type},
+                {"capture_id", t.capture_id},
+                {"order_id", t.order_id},
+                {"amount_cents", t.amount_cents},
+                {"currency", t.currency},
+                {"status", t.status},
+                {"create_time", t.create_time},
+                {"risk_score", t.risk_score},
+                {"reasons", t.reasons},
+                {"ai_decision", static_cast<int>(t.ai_decision)},
+                {"ai_explanation", t.ai_explanation},
+                {"action_taken", t.action_taken},
+                {"received_at", t.received_at}
+            });
+        }
+        res.set_content(j.dump(), "application/json");
+        res.status = 200;
+    });
 
     // TODO: GET /            (dashboard: table of transactions, risk, AI reasoning, action)
 
@@ -521,7 +611,7 @@ int main()
 }
 
 // ---------------------------------------------------------------------------
-// 9. BENCHMARK (do this last, it's your C++ selling point)
+// 9. BENCHMARK
 // TODO: separate executable or mode that replays N synthetic events through
 //       parse + score and reports events/sec and p50 / p99 / p99.9 latency.
 // ---------------------------------------------------------------------------
